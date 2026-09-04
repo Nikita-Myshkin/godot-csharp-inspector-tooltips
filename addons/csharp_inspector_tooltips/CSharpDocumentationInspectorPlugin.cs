@@ -14,6 +14,7 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
 {
     private readonly Dictionary<string, Dictionary<string, string>> _documentation = new();
     private readonly Dictionary<string, string> _currentTooltips = new();
+    private readonly Dictionary<string, Type> _typesByClassName = new();
     private readonly string _xmlPath;
     private DateTime _lastWriteTimeUtc;
 
@@ -43,8 +44,20 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
 
     public override bool _CanHandle(GodotObject @object)
     {
-        return TryGetCSharpClassName(@object, out string className) &&
-               _documentation.ContainsKey(className);
+        if (!TryGetScriptType(@object, out Type? scriptType) || scriptType == null)
+        {
+            return false;
+        }
+
+        foreach (Type type in WalkProjectTypes(scriptType))
+        {
+            if (_documentation.ContainsKey(type.FullName ?? string.Empty))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public override bool _ParseProperty(
@@ -56,8 +69,7 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         PropertyUsageFlags usageFlags,
         bool wide)
     {
-        if (TryGetCSharpClassName(@object, out string className) &&
-            TryGetDescription(className, name, out string description))
+        if (TryGetDescription(@object, name, out string description))
         {
             _currentTooltips[NormalizeName(name)] = description;
         }
@@ -122,19 +134,48 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         }
     }
 
-    private bool TryGetDescription(string className, string propertyName, out string description)
+    private bool TryGetDescription(GodotObject @object, string propertyName, out string description)
     {
         description = string.Empty;
 
-        if (!_documentation.TryGetValue(className, out Dictionary<string, string>? properties) ||
-            !properties.TryGetValue(NormalizeName(propertyName), out string? foundDescription) ||
-            foundDescription == null)
+        if (!TryGetScriptType(@object, out Type? scriptType) || scriptType == null)
         {
             return false;
         }
 
-        description = foundDescription;
-        return true;
+        string normalizedProperty = NormalizeName(propertyName);
+
+        foreach (Type type in WalkProjectTypes(scriptType))
+        {
+            if (_documentation.TryGetValue(type.FullName ?? string.Empty, out Dictionary<string, string>? properties) &&
+                properties.TryGetValue(normalizedProperty, out string? foundDescription) &&
+                foundDescription != null)
+            {
+                description = foundDescription;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the C# type behind a Godot object's attached script.
+    /// <para>
+    /// This intentionally does NOT use <c>@object.GetType()</c>: a script without
+    /// <c>[Tool]</c> only gets a real, fully-typed instance while the game is
+    /// running. While just editing a scene in the editor, Godot instead gives it a
+    /// placeholder instance typed as its native base class (e.g. <c>Node</c>), so
+    /// <c>@object.GetType()</c> would not return the actual script class there.
+    /// The script's file path is available in both cases, so the class is resolved
+    /// from that instead, via <see cref="_typesByClassName"/>.
+    /// </para>
+    /// </summary>
+    private bool TryGetScriptType(GodotObject @object, out Type? type)
+    {
+        type = null;
+        return TryGetCSharpClassName(@object, out string className) &&
+               _typesByClassName.TryGetValue(className, out type);
     }
 
     private static bool TryGetCSharpClassName(GodotObject @object, out string className)
@@ -157,6 +198,58 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
 
         className = Path.GetFileNameWithoutExtension(scriptPath);
         return !string.IsNullOrWhiteSpace(className);
+    }
+
+    /// <summary>
+    /// Rebuilds the class-name -> Type cache from every currently loaded assembly.
+    /// Done once per XML documentation reload (i.e. once per C# build), not per
+    /// Inspector property, so the cost of scanning assemblies is paid rarely.
+    /// If two classes anywhere share a simple name, the first one found wins -
+    /// documentation is still stored per fully-qualified name, so this only risks
+    /// resolving the wrong Type for that rare collision, not mixing up their docs.
+    /// </summary>
+    private void RebuildTypeIndex()
+    {
+        _typesByClassName.Clear();
+
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException exception)
+            {
+                types = exception.Types.Where(t => t != null).ToArray()!;
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            foreach (Type type in types)
+            {
+                _typesByClassName.TryAdd(type.Name, type);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Walks <paramref name="scriptType"/> and its base classes, stopping once it
+    /// reaches Godot's own engine types (Node, Resource, GodotObject, ...) since
+    /// project documentation never lives there.
+    /// </summary>
+    private static IEnumerable<Type> WalkProjectTypes(Type scriptType)
+    {
+        Assembly engineAssembly = typeof(GodotObject).Assembly;
+
+        for (Type? currentType = scriptType;
+             currentType != null && currentType.Assembly != engineAssembly;
+             currentType = currentType.BaseType)
+        {
+            yield return currentType;
+        }
     }
 
     private bool TryLoadDocumentation(DateTime writeTimeUtc)
@@ -182,7 +275,7 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
                     continue;
                 }
 
-                if (!TrySplitMemberId(memberId[2..], out string className, out string propertyName))
+                if (!TrySplitMemberId(memberId[2..], out string typeName, out string propertyName))
                 {
                     continue;
                 }
@@ -193,21 +286,22 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
                     continue;
                 }
 
-                if (!loadedDocumentation.TryGetValue(className, out Dictionary<string, string>? properties))
+                if (!loadedDocumentation.TryGetValue(typeName, out Dictionary<string, string>? properties))
                 {
                     properties = new Dictionary<string, string>();
-                    loadedDocumentation[className] = properties;
+                    loadedDocumentation[typeName] = properties;
                 }
 
                 properties[NormalizeName(propertyName)] = description;
             }
 
             _documentation.Clear();
-            foreach ((string className, Dictionary<string, string> properties) in loadedDocumentation)
+            foreach ((string typeName, Dictionary<string, string> properties) in loadedDocumentation)
             {
-                _documentation[className] = properties;
+                _documentation[typeName] = properties;
             }
 
+            RebuildTypeIndex();
             _lastWriteTimeUtc = writeTimeUtc;
             return true;
         }
@@ -218,12 +312,17 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         }
     }
 
+    /// <summary>
+    /// Splits a "Namespace.Outer.Property" member id into its full, namespace-qualified
+    /// type name and its property name. Keeping the namespace avoids mixing up two
+    /// classes that share a simple name in different namespaces.
+    /// </summary>
     private static bool TrySplitMemberId(
         string memberId,
-        out string className,
+        out string typeName,
         out string propertyName)
     {
-        className = string.Empty;
+        typeName = string.Empty;
         propertyName = string.Empty;
 
         int propertySeparator = memberId.LastIndexOf('.');
@@ -233,13 +332,9 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         }
 
         propertyName = memberId[(propertySeparator + 1)..];
-        string typeName = memberId[..propertySeparator];
-        int namespaceSeparator = typeName.LastIndexOf('.');
-        className = namespaceSeparator >= 0
-            ? typeName[(namespaceSeparator + 1)..]
-            : typeName;
+        typeName = memberId[..propertySeparator];
 
-        return className.Length > 0 && propertyName.Length > 0;
+        return typeName.Length > 0 && propertyName.Length > 0;
     }
 
     private static string NormalizeDescription(string description)
