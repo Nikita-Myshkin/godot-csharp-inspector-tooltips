@@ -6,6 +6,7 @@ An editor plugin that displays C# XML `<summary>` comments as tooltips for expor
 
 - Uses standard C# XML documentation comments.
 - Supports exported fields and properties.
+- Supports properties inherited from a base class.
 - Preserves line breaks and blank lines.
 - Reloads documentation automatically after a C# build.
 - Runs only in the editor and does not affect game performance.
@@ -67,7 +68,9 @@ Prefer two to four short lines. Avoid repeating the field name or its type.
 
 ## How It Works
 
-The C# compiler writes `<summary>` comments to the generated XML documentation file. The plugin reads that file, matches documented members to C# scripts and Inspector properties, then assigns the text to the existing Inspector controls.
+The C# compiler writes `<summary>` comments to the generated XML documentation file, keyed by each member's full, namespace-qualified name. Whenever that file changes (i.e. after a build), the plugin also scans loaded assemblies once to map each class's file name to its actual C# `Type`. For an inspected object, it reads the attached script's file name, looks up that `Type`, and walks up its base classes to find documented members - which is what makes tooltips work for properties declared on a parent script - before assigning the text to the existing Inspector controls.
+
+The lookup is based on the script's file name rather than `@object.GetType()`: an object whose script is not marked `[Tool]` only gets a real, fully-typed instance while the game is running; while just editing a scene in the editor it gets a placeholder instance typed as its native base class, so `@object.GetType()` would not give the actual script class there.
 
 The XML file is checked once per second inside the editor. The plugin code is wrapped in `#if TOOLS`, so it is excluded from exported games.
 
@@ -78,6 +81,7 @@ The XML file is checked once per second inside the editor. The plugin code is wr
 - The C# class name should match its script filename.
 - Documentation is currently read from the editor Debug build output.
 - `<summary>` is supported; other XML elements such as `<remarks>` are not yet processed separately.
+- If two classes anywhere in the project share the same simple name (in different namespaces), the wrong one may be resolved for tooltip lookup even though each keeps its own documentation internally.
 
 ## Troubleshooting
 
@@ -95,7 +99,7 @@ Then build the C# project and restart the editor if necessary.
 
 - Confirm `<GenerateDocumentationFile>true</GenerateDocumentationFile>` is present in the `.csproj`.
 - Build the C# project.
-- Confirm the comment uses `<summary>` and is directly above an `[Export]` field or property.
+- Confirm the comment uses `<summary>` and is directly above an `[Export]` field or property, either on the script itself or on one of its base classes.
 - Confirm the script filename matches the C# class name.
 
 ## License
