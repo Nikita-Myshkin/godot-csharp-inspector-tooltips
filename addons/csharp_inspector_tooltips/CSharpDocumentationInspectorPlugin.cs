@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Xml.Linq;
 
 namespace CSharpInspectorTooltips.Editor;
@@ -15,31 +16,62 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
     private readonly Dictionary<string, Dictionary<string, string>> _documentation = new();
     private readonly Dictionary<string, string> _currentTooltips = new();
     private readonly Dictionary<string, Type> _typesByClassName = new();
-    private readonly string _xmlPath;
+    private readonly string _assemblyName;
+    private string? _lastXmlPath;
     private DateTime _lastWriteTimeUtc;
 
     public CSharpDocumentationInspectorPlugin()
     {
-        string assemblyName = Assembly.GetExecutingAssembly().GetName().Name ?? string.Empty;
-        _xmlPath = ProjectSettings.GlobalizePath(
-            $"res://.godot/mono/temp/bin/Debug/{assemblyName}.xml");
+        _assemblyName = Assembly.GetExecutingAssembly().GetName().Name ?? string.Empty;
         ReloadDocumentationIfChanged();
     }
 
     public bool ReloadDocumentationIfChanged()
     {
-        if (!File.Exists(_xmlPath))
+        string? xmlPath = ResolveXmlPath();
+        if (xmlPath == null)
         {
             return false;
         }
 
-        DateTime writeTimeUtc = File.GetLastWriteTimeUtc(_xmlPath);
-        if (writeTimeUtc == _lastWriteTimeUtc)
+        DateTime writeTimeUtc = File.GetLastWriteTimeUtc(xmlPath);
+        if (xmlPath == _lastXmlPath && writeTimeUtc == _lastWriteTimeUtc)
         {
             return false;
         }
 
-        return TryLoadDocumentation(writeTimeUtc);
+        return TryLoadDocumentation(xmlPath, writeTimeUtc);
+    }
+
+    /// <summary>
+    /// Finds the compiler-generated XML doc file. The editor almost always
+    /// builds Debug, but a team that builds Release in the editor would
+    /// otherwise silently get no tooltips at all - so both output folders are
+    /// checked, preferring whichever file is newest when both exist.
+    /// </summary>
+    private string? ResolveXmlPath()
+    {
+        string debugPath = ProjectSettings.GlobalizePath(
+            $"res://.godot/mono/temp/bin/Debug/{_assemblyName}.xml");
+        string releasePath = ProjectSettings.GlobalizePath(
+            $"res://.godot/mono/temp/bin/Release/{_assemblyName}.xml");
+
+        bool debugExists = File.Exists(debugPath);
+        bool releaseExists = File.Exists(releasePath);
+
+        if (!debugExists && !releaseExists)
+        {
+            return null;
+        }
+
+        if (debugExists && releaseExists)
+        {
+            return File.GetLastWriteTimeUtc(debugPath) >= File.GetLastWriteTimeUtc(releasePath)
+                ? debugPath
+                : releasePath;
+        }
+
+        return debugExists ? debugPath : releasePath;
     }
 
     public override bool _CanHandle(GodotObject @object)
@@ -252,11 +284,11 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         }
     }
 
-    private bool TryLoadDocumentation(DateTime writeTimeUtc)
+    private bool TryLoadDocumentation(string xmlPath, DateTime writeTimeUtc)
     {
         try
         {
-            XDocument document = XDocument.Load(_xmlPath);
+            XDocument document = XDocument.Load(xmlPath);
             var loadedDocumentation = new Dictionary<string, Dictionary<string, string>>();
 
             foreach (XElement member in document.Descendants("member"))
@@ -280,7 +312,7 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
                     continue;
                 }
 
-                string description = NormalizeDescription(summary.Value);
+                string description = NormalizeDescription(ExtractSummaryText(summary));
                 if (description.Length == 0)
                 {
                     continue;
@@ -302,6 +334,7 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
             }
 
             RebuildTypeIndex();
+            _lastXmlPath = xmlPath;
             _lastWriteTimeUtc = writeTimeUtc;
             return true;
         }
@@ -335,6 +368,64 @@ public partial class CSharpDocumentationInspectorPlugin : EditorInspectorPlugin
         typeName = memberId[..propertySeparator];
 
         return typeName.Length > 0 && propertyName.Length > 0;
+    }
+
+    /// <summary>
+    /// Extracts the readable text of a <c>&lt;summary&gt;</c> element. Plain
+    /// <see cref="XElement.Value"/> silently drops any self-closing tag that
+    /// carries its meaning in an attribute rather than in text - e.g.
+    /// <c>&lt;see cref="Foo"/&gt;</c> contributes nothing to <c>.Value</c>, so a
+    /// sentence referencing another member would just lose that name. This walks
+    /// the summary itself instead and falls back to the <c>cref</c>/<c>name</c>
+    /// attribute's simple (last-segment) name whenever such a tag has no text of
+    /// its own. A tag written with explicit text (e.g. <c>&lt;see cref="Foo"&gt;that other thing&lt;/see&gt;</c>)
+    /// keeps that text untouched.
+    /// </summary>
+    private static string ExtractSummaryText(XElement summary)
+    {
+        var builder = new StringBuilder();
+        AppendNodeText(summary, builder);
+        return builder.ToString();
+    }
+
+    private static void AppendNodeText(XNode node, StringBuilder builder)
+    {
+        switch (node)
+        {
+            case XText text:
+                builder.Append(text.Value);
+                return;
+
+            case XElement element when string.IsNullOrEmpty(element.Value):
+                string? reference = element.Attribute("cref")?.Value ?? element.Attribute("name")?.Value;
+                if (reference != null)
+                {
+                    builder.Append(GetSimpleReferenceName(reference));
+                    return;
+                }
+
+                break;
+
+            case XElement element:
+                foreach (XNode child in element.Nodes())
+                {
+                    AppendNodeText(child, builder);
+                }
+
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Reduces a cref-style reference (e.g. "T:Namespace.Outer.Inner") to just
+    /// its last segment ("Inner") - a readable name instead of the raw XML doc
+    /// identifier format.
+    /// </summary>
+    private static string GetSimpleReferenceName(string reference)
+    {
+        string withoutPrefix = reference.Length > 1 && reference[1] == ':' ? reference[2..] : reference;
+        int lastSeparator = withoutPrefix.LastIndexOf('.');
+        return lastSeparator >= 0 ? withoutPrefix[(lastSeparator + 1)..] : withoutPrefix;
     }
 
     private static string NormalizeDescription(string description)
