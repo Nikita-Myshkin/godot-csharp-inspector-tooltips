@@ -79,8 +79,8 @@ The XML file is checked once per second inside the editor. The plugin code is wr
 - Only Godot 4.7 .NET has been tested.
 - A C# build is required after changing documentation.
 - The C# class name should match its script filename.
-- Documentation is currently read from the editor Debug build output.
-- `<summary>` is supported; other XML elements such as `<remarks>` are not yet processed separately.
+- Documentation is read from the editor Debug or Release build output, whichever is newer; other build configurations are not checked.
+- `<summary>` is supported; other XML elements such as `<remarks>` are not yet processed separately. Reference tags with no text of their own (e.g. `<see cref="Other"/>`, `<paramref name="value"/>`) show their referenced name instead of disappearing.
 - If two classes anywhere in the project share the same simple name (in different namespaces), the wrong one may be resolved for tooltip lookup even though each keeps its own documentation internally.
 
 ## Troubleshooting

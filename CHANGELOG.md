@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- A self-closing reference tag with no text of its own (e.g. `<see cref="Other"/>`, `<paramref name="value"/>`) no longer silently disappears from a tooltip - it now shows the referenced name instead.
+- Documentation is now also read from a Release editor build if that is newer than the Debug one, instead of only ever checking Debug.
+
 ## [1.0.1] - 2026-09-04
 
 ### Fixed
